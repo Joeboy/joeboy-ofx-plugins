@@ -12,6 +12,7 @@
 *.so
 *.dylib
 *.dll
+*.dso
 
 # Fortran module files
 *.mod
@@ -26,3 +27,6 @@
 *.exe
 *.out
 *.app
+
+# Other
+*.bundle
