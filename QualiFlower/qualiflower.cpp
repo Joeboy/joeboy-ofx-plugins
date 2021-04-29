@@ -1,861 +1,89 @@
+#include "qualiflower.h"
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <math.h>
 
-#include <string>
-#include <iostream>
+#include "ofxsImageEffect.h"
+#include "ofxsMultiThread.h"
+#include "ofxsProcessing.h"
+#include "ofxsLog.h"
 
-// the one OFX header we need, it includes the others necessary
-#include "ofxImageEffect.h"
+#define kPluginName "QualiFlower"
+#define kPluginGrouping "Matte"
+#define kPluginDescription "Make selections based on image hue, saturation and luminance"
+#define kPluginIdentifier "joeboy.QualiFlower"
+#define kPluginVersionMajor 0
+#define kPluginVersionMinor 2
 
-#if defined __APPLE__ || defined linux
-#  define EXPORT __attribute__((visibility("default")))
-#elif defined _WIN32
-#  define EXPORT OfxExport
-#else
-#  error Not building on your operating system quite yet
-#endif
+#define kSupportsTiles false
+#define kSupportsMultiResolution false
+#define kSupportsMultipleClipPARs false
 
 ////////////////////////////////////////////////////////////////////////////////
-// macro to write a labelled message to stderr with
-#ifdef _WIN32
-  #define DUMP(LABEL, MSG, ...)                                           \
-  {                                                                       \
-    fprintf(stderr, "%s%s:%d in %s ", LABEL, __FILE__, __LINE__, __FUNCTION__); \
-    fprintf(stderr, MSG, ##__VA_ARGS__);                                  \
-    fprintf(stderr, "\n");                                                \
-  }
-#else
-  #define DUMP(LABEL, MSG, ...)                                           \
-  {                                                                       \
-    fprintf(stderr, "%s%s:%d in %s ", LABEL, __FILE__, __LINE__, __PRETTY_FUNCTION__); \
-    fprintf(stderr, MSG, ##__VA_ARGS__);                                  \
-    fprintf(stderr, "\n");                                                \
-  }
-#endif
 
-// macro to write a simple message, only works if 'VERBOSE' is #defined
-//#define VERBOSE
-#ifdef VERBOSE
-#  define MESSAGE(MSG, ...) DUMP("", MSG, ##__VA_ARGS__)
-#else
-#  define MESSAGE(MSG, ...)
-#endif
+class ImageScaler : public OFX::ImageProcessor
+{
+public:
+    explicit ImageScaler(OFX::ImageEffect& p_Instance);
 
-// macro to dump errors to stderr if the given condition is true
-#define ERROR_IF(CONDITION, MSG, ...) if(CONDITION) { DUMP("ERROR : ", MSG, ##__VA_ARGS__);}
+    virtual void processImagesCUDA();
+    virtual void multiThreadProcessImages(OfxRectI p_ProcWindow);
 
-// macro to dump errors to stderr and abort if the given condition is true
-#define ERROR_ABORT_IF(CONDITION, MSG, ...)     \
-{                                               \
-  if(CONDITION) {                               \
-    DUMP("FATAL ERROR : ", MSG, ##__VA_ARGS__); \
-    abort();                                    \
-  }                                             \
+    void setSrcImg(OFX::Image* p_SrcImg);
+    void setParams(
+        bool p_hueEnabled, float p_hue, float p_hueWidth, float p_hueSoftness,
+        bool p_saturationEnabled, float p_saturationLow, float p_saturationHigh, float p_saturationLowSoftness, float p_saturationHighSoftness,
+        bool p_luminanceEnabled, float p_luminanceLow, float p_luminanceHigh, float p_luminanceLowSoftness, float p_luminanceHighSoftness
+    );
+
+
+
+private:
+    OFX::Image* _srcImg;
+    bool _hueEnabled, _saturationEnabled, _luminanceEnabled;
+    float _hue, _hueWidth, _hueSoftness;
+    float _saturationLow, _saturationHigh, _saturationLowSoftness, _saturationHighSoftness;
+    float _luminanceLow, _luminanceHigh, _luminanceLowSoftness, _luminanceHighSoftness;
+};
+
+ImageScaler::ImageScaler(OFX::ImageEffect& p_Instance)
+    : OFX::ImageProcessor(p_Instance)
+{
 }
 
-// name of our two params
-#define HUE_ENABLED_PARAM_NAME "hueEnabled"
-#define HUE_PARAM_NAME "hue"
-#define HUE_WIDTH_PARAM_NAME "hueWidth"
-#define HUE_SOFTNESS_PARAM_NAME "hueSoftness"
-#define SATURATION_ENABLED_PARAM_NAME "saturationEnabled"
-#define SATURATION_LOW_PARAM_NAME "saturationLow"
-#define SATURATION_HIGH_PARAM_NAME "saturationHigh"
-#define SATURATION_LOW_SOFTNESS_PARAM_NAME "saturationLowSoftness"
-#define SATURATION_HIGH_SOFTNESS_PARAM_NAME "saturationHighSoftness"
-#define LUMINANCE_ENABLED_PARAM_NAME "luminanceEnabled"
-#define LUMINANCE_LOW_PARAM_NAME "luminanceLow"
-#define LUMINANCE_HIGH_PARAM_NAME "luminanceHigh"
-#define LUMINANCE_LOW_SOFTNESS_PARAM_NAME "luminanceLowSoftness"
-#define LUMINANCE_HIGH_SOFTNESS_PARAM_NAME "luminanceHighSoftness"
+#ifndef __APPLE__
+extern void RunCudaKernel(
+    void* p_Stream, int p_Width, int p_Height,
+    bool hueEnabled, float hue, float hueWidth, float hueSoftness,
+    bool saturationEnabled, float saturationLow, float saturationHigh, float saturationLowSoftness, float saturationHighSoftness,
+    bool luminanceEnabled, float luminanceLow, float luminanceHigh, float luminanceLowSoftness, float luminanceHighSoftness,
+    const float* p_Input, float* p_Output
+);
+#endif
 
-// anonymous namespace to hide our symbols in
-namespace {
-  ////////////////////////////////////////////////////////////////////////////////
-  // set of suite pointers provided by the host
-  OfxHost               *gHost;
-  OfxPropertySuiteV1    *gPropertySuite    = 0;
-  OfxImageEffectSuiteV1 *gImageEffectSuite = 0;
-  OfxParameterSuiteV1   *gParameterSuite   = 0;
+void ImageScaler::processImagesCUDA()
+{
+#ifndef __APPLE__
+    const OfxRectI& bounds = _srcImg->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
 
-  ////////////////////////////////////////////////////////////////////////////////
-  // our instance data, where we are caching away clip and param handles
-  struct MyInstanceData {
-    // handles to the clips we deal with
-    OfxImageClipHandle sourceClip;
-    OfxImageClipHandle outputClip;
+    float* input = static_cast<float*>(_srcImg->getPixelData());
+    float* output = static_cast<float*>(_dstImg->getPixelData());
 
-    // handles to a our parameters
-    OfxParamHandle hueEnabledParam;
-    OfxParamHandle hueParam;
-    OfxParamHandle hueWidthParam;
-    OfxParamHandle hueSoftnessParam;
-    OfxParamHandle saturationEnabledParam;
-    OfxParamHandle saturationLowParam;
-    OfxParamHandle saturationHighParam;
-    OfxParamHandle saturationLowSoftnessParam;
-    OfxParamHandle saturationHighSoftnessParam;
-    OfxParamHandle luminanceEnabledParam;
-    OfxParamHandle luminanceLowParam;
-    OfxParamHandle luminanceHighParam;
-    OfxParamHandle luminanceLowSoftnessParam;
-    OfxParamHandle luminanceHighSoftnessParam;
-  };
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // get my instance data from a property set handle
-  MyInstanceData *FetchInstanceData(OfxPropertySetHandle effectProps)
-  {
-    MyInstanceData *myData = 0;
-    gPropertySuite->propGetPointer(effectProps,
-                                   kOfxPropInstanceData,
-                                   0,
-                                   (void **) &myData);
-    return myData;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // get my instance data
-  MyInstanceData *FetchInstanceData(OfxImageEffectHandle effect)
-  {
-    // get the property handle for the plugin
-    OfxPropertySetHandle effectProps;
-    gImageEffectSuite->getPropertySet(effect, &effectProps);
-
-    // and get the instance data out of that
-    return FetchInstanceData(effectProps);
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // get the named suite and put it in the given pointer, with error checking
-  template <class SUITE>
-  void FetchSuite(SUITE *& suite, const char *suiteName, int suiteVersion)
-  {
-    suite = (SUITE *) gHost->fetchSuite(gHost->host, suiteName, suiteVersion);
-    if(!suite) {
-      ERROR_ABORT_IF(suite == NULL,
-                     "Failed to fetch %s version %d from the host.",
-                     suiteName,
-                     suiteVersion);
-    }
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // The first _action_ called after the binary is loaded (three boot strapper functions will be howeever)
-  OfxStatus LoadAction(void)
-  {
-    // fetch our three suites
-    FetchSuite(gPropertySuite,    kOfxPropertySuite,    1);
-    FetchSuite(gImageEffectSuite, kOfxImageEffectSuite, 1);
-    FetchSuite(gParameterSuite,   kOfxParameterSuite,   1);
-
-    return kOfxStatOK;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // the plugin's basic description routine
-  OfxStatus DescribeAction(OfxImageEffectHandle descriptor)
-  {
-    // get the property set handle for the plugin
-    OfxPropertySetHandle effectProps;
-    gImageEffectSuite->getPropertySet(descriptor, &effectProps);
-
-    // set some labels and the group it belongs to
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "QualiFlower");
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPluginPropGrouping,
-                                  0,
-                                  "Mask");
-
-    // define the image effects contexts we can be used in, in this case a simple filter
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPropSupportedContexts,
-                                  0,
-                                  kOfxImageEffectContextFilter);
-
-    // set the bit depths the plugin can handle
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPropSupportedPixelDepths,
-                                  0,
-                                  kOfxBitDepthFloat);
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPropSupportedPixelDepths,
-                                  1,
-                                  kOfxBitDepthShort);
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPropSupportedPixelDepths,
-                                  2,
-                                  kOfxBitDepthByte);
-
-    // say that a single instance of this plugin can be rendered in multiple threads
-    gPropertySuite->propSetString(effectProps,
-                                  kOfxImageEffectPluginRenderThreadSafety,
-                                  0,
-                                  kOfxImageEffectRenderFullySafe);
-
-    // say that the host should manage SMP threading over a single frame
-    gPropertySuite->propSetInt(effectProps,
-                               kOfxImageEffectPluginPropHostFrameThreading,
-                               0,
-                               1);
+    RunCudaKernel(
+        _pCudaStream, width, height,
+        _hueEnabled, _hue, _hueWidth, _hueSoftness,
+        _saturationEnabled, _saturationLow, _saturationHigh, _saturationLowSoftness, _saturationHighSoftness,
+        _luminanceEnabled, _luminanceLow, _luminanceHigh, _luminanceLowSoftness, _luminanceHighSoftness,
+        input, output
+    );
+#endif
+}
 
 
-    return kOfxStatOK;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  //  describe the plugin in context
-  OfxStatus
-  DescribeInContextAction(OfxImageEffectHandle descriptor,
-                          OfxPropertySetHandle inArgs)
-  {
-    OfxPropertySetHandle props;
-    // define the mandated single output clip
-    gImageEffectSuite->clipDefine(descriptor, "Output", &props);
-
-    // set the component types we can handle on out output
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  0,
-                                  kOfxImageComponentRGBA);
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  1,
-                                  kOfxImageComponentAlpha);
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  2,
-                                  kOfxImageComponentRGB);
-
-    // define the mandated single source clip
-    gImageEffectSuite->clipDefine(descriptor, "Source", &props);
-
-    // set the component types we can handle on our main input
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  0,
-                                  kOfxImageComponentRGBA);
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  1,
-                                  kOfxImageComponentAlpha);
-    gPropertySuite->propSetString(props,
-                                  kOfxImageEffectPropSupportedComponents,
-                                  2,
-                                  kOfxImageComponentRGB);
-
-    // first get the handle to the parameter set
-    OfxParamSetHandle paramSet;
-    gImageEffectSuite->getParamSet(descriptor, &paramSet);
-
-    // properties on our parameter
-    OfxPropertySetHandle paramProps;
-
-    // "Hue bypass" parameter
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeBoolean,
-                                 HUE_ENABLED_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetInt(paramProps,
-                               kOfxParamPropDefault,
-                               0,
-                               0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Enable selection by hue.");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Select by Hue");
-
-
-    // 'hue' parameter and properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 HUE_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  50.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Hue");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Hue selection.");
-
-    // now define a 'hueWidth' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 HUE_WIDTH_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  10.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Hue Width");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Width of hue selection.");
-
-    // now define a 'hue softness' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 HUE_SOFTNESS_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  5);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  50.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  50.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Hue Softness");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Softness of hue selection.");
-
-    // "Saturation bypass" parameter
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeBoolean,
-                                 SATURATION_ENABLED_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetInt(paramProps,
-                               kOfxParamPropDefault,
-                               0,
-                               0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Enable selection by Saturation.");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Select by Saturation");
-
-    // now define a 'saturation low' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 SATURATION_LOW_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Saturation Low");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Saturation Low selection.");
-
-    // now define a 'saturation high' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 SATURATION_HIGH_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Saturation High");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Saturation High selection.");
-
-    // now define a 'saturation low softness' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 SATURATION_LOW_SOFTNESS_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  10.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Saturation Low Softness");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Saturation Low Softness selection.");
-
-    // now define a 'saturation high softness' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 SATURATION_HIGH_SOFTNESS_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  10.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Saturation High Softness");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Saturation High Softness selection.");
-
-    // "Luminance bypass" parameter
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeBoolean,
-                                 LUMINANCE_ENABLED_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetInt(paramProps,
-                               kOfxParamPropDefault,
-                               0,
-                               0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Enable selection by Luminance.");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Select by luminance");
-
-    // now define a 'luminance low' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 LUMINANCE_LOW_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Luminance Low");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Luminance Low selection.");
-
-    // now define a 'luminance high' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 LUMINANCE_HIGH_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Luminance High");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Luminance High selection.");
-
-    // now define a 'luminance low softness' parameter and set its properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 LUMINANCE_LOW_SOFTNESS_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  10.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Luminance Low Softness");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Luminance Low Softness selection.");
-
-    // 'luminance high softness' parameter and properties
-    gParameterSuite->paramDefine(paramSet,
-                                 kOfxParamTypeDouble,
-                                 LUMINANCE_HIGH_SOFTNESS_PARAM_NAME,
-                                 &paramProps);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropDoubleType,
-                                  0,
-                                  kOfxParamDoubleTypeScale);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDefault,
-                                  0,
-                                  10.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMin,
-                                  0,
-                                  0.0);
-    gPropertySuite->propSetDouble(paramProps,
-                                  kOfxParamPropDisplayMax,
-                                  0,
-                                  100.0);
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxPropLabel,
-                                  0,
-                                  "Luminance High Softness");
-    gPropertySuite->propSetString(paramProps,
-                                  kOfxParamPropHint,
-                                  0,
-                                  "Luminance High Softness selection.");
-
-    return kOfxStatOK;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  /// instance construction
-  OfxStatus CreateInstanceAction( OfxImageEffectHandle instance)
-  {
-    OfxPropertySetHandle effectProps;
-    gImageEffectSuite->getPropertySet(instance, &effectProps);
-
-    // To avoid continual lookup, put our handles into our instance
-    // data, those handles are guaranteed to be valid for the duration
-    // of the instance.
-    MyInstanceData *myData = new MyInstanceData;
-
-    // Set my private instance data
-    gPropertySuite->propSetPointer(effectProps, kOfxPropInstanceData, 0, (void *) myData);
-
-    // Cache the source and output clip handles
-    gImageEffectSuite->clipGetHandle(instance, "Source", &myData->sourceClip, 0);
-    gImageEffectSuite->clipGetHandle(instance, "Output", &myData->outputClip, 0);
-
-    // Cache away the param handles
-    OfxParamSetHandle paramSet;
-    gImageEffectSuite->getParamSet(instance, &paramSet);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    HUE_ENABLED_PARAM_NAME,
-                                    &myData->hueEnabledParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    HUE_PARAM_NAME,
-                                    &myData->hueParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    HUE_WIDTH_PARAM_NAME,
-                                    &myData->hueWidthParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    HUE_SOFTNESS_PARAM_NAME,
-                                    &myData->hueSoftnessParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    SATURATION_ENABLED_PARAM_NAME,
-                                    &myData->saturationEnabledParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    SATURATION_LOW_PARAM_NAME,
-                                    &myData->saturationLowParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    SATURATION_HIGH_PARAM_NAME,
-                                    &myData->saturationHighParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    SATURATION_LOW_SOFTNESS_PARAM_NAME,
-                                    &myData->saturationLowSoftnessParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    SATURATION_HIGH_SOFTNESS_PARAM_NAME,
-                                    &myData->saturationHighSoftnessParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    LUMINANCE_ENABLED_PARAM_NAME,
-                                    &myData->luminanceEnabledParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    LUMINANCE_LOW_PARAM_NAME,
-                                    &myData->luminanceLowParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    LUMINANCE_HIGH_PARAM_NAME,
-                                    &myData->luminanceHighParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    LUMINANCE_LOW_SOFTNESS_PARAM_NAME,
-                                    &myData->luminanceLowSoftnessParam,
-                                    0);
-    gParameterSuite->paramGetHandle(paramSet,
-                                    LUMINANCE_HIGH_SOFTNESS_PARAM_NAME,
-                                    &myData->luminanceHighSoftnessParam,
-                                    0);
-
-    return kOfxStatOK;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // instance destruction
-  OfxStatus DestroyInstanceAction( OfxImageEffectHandle instance)
-  {
-    // get my instance data
-    MyInstanceData *myData = FetchInstanceData(instance);
-    delete myData;
-
-    return kOfxStatOK;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // Look up a pixel in the image. returns null if the pixel was not
-  // in the bounds of the image
-  template <class T>
-  static inline T * pixelAddress(int x, int y,
-                                 void *baseAddress,
-                                 OfxRectI bounds,
-                                 int rowBytes,
-                                 int nCompsPerPixel)
-  {
-    // Inside the bounds of this image?
-    if(x < bounds.x1 || x >= bounds.x2 || y < bounds.y1 || y >= bounds.y2)
-      return NULL;
-
-    // turn image plane coordinates into offsets from the bottom left
-    int yOffset = y - bounds.y1;
-    int xOffset = x - bounds.x1;
-
-    // Find the start of our row, using byte arithmetic
-    void *rowStartAsVoid = reinterpret_cast<char *>(baseAddress) + yOffset * rowBytes;
-
-    // turn the row start into a pointer to our data type
-    T *rowStart = reinterpret_cast<T *>(rowStartAsVoid);
-
-    // finally find the position of the first component of column
-    return rowStart + (xOffset * nCompsPerPixel);
-  }
-
-
-  void rgb2hsl(double r, double g, double b, double *h, double *s, double *l)
-  {
+void rgb2hsl(double r, double g, double b, double *h, double *s, double *l)
+{
     // rgb are 0->1, return hsl as 0->100
     double min, max, delta;
 
@@ -865,7 +93,9 @@ namespace {
     max = r > g ? r : g;
     max = max  > b ? max  : b;
 
-    // For some reason max can be (slightly) > 1
+    // I seems these rgb values can be > 1. I'm going to just clamp them,
+    // but maybe the right thing would be to assume a range of 0->highest_value_in_image,
+    // rather than 1->1? Not sure.
     *l = max >= 1.0 ? 100.0 : 100.0 * max;
 
     delta = max - min;
@@ -882,7 +112,7 @@ namespace {
         *h = NAN;
         return;
     }
-    if( r >= max ) {                          // > is bogus, just keeps compiler happy
+    if( r >= max ) {                 // > is bogus, just keeps compiler happy
         *h = (g - b) / delta;        // between yellow & magenta
     } else if(g >= max) {
         *h = 2.0 + (b - r) / delta;  // between cyan & yellow
@@ -896,414 +126,487 @@ namespace {
     if (*h < 0.0) *h += 100.0;
 
     return;
-  }
+}
 
 
-
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // iterate over our pixels and process them
-  template <class T, int MAX>
-  void PixelProcessing(
-                       int hue_enabled,
-                       double hue,
-                       double hue_width,
-                       double hue_softness,
-                       int saturation_enabled,
-                       double saturation_low,
-                       double saturation_high,
-                       double saturation_low_softness,
-                       double saturation_high_softness,
-                       int luminance_enabled,
-                       double luminance_low,
-                       double luminance_high,
-                       double luminance_low_softness,
-                       double luminance_high_softness,
-                       OfxImageEffectHandle instance,
-                       OfxPropertySetHandle sourceImg,
-                       OfxPropertySetHandle outputImg,
-                       OfxRectI renderWindow,
-                       int nComps)
-  {
-    printf("PixelProcessing\n");
-    // fetch output image info from the property handle
-    int dstRowBytes;
-    OfxRectI dstBounds;
-    void *dstPtr = NULL;
-    gPropertySuite->propGetInt(outputImg, kOfxImagePropRowBytes, 0, &dstRowBytes);
-    gPropertySuite->propGetIntN(outputImg, kOfxImagePropBounds, 4, &dstBounds.x1);
-    gPropertySuite->propGetPointer(outputImg, kOfxImagePropData, 0, &dstPtr);
-
-    if(dstPtr == NULL) {
-      throw "Bad destination pointer";
-    }
-
-    // fetch input image info from the property handle
-    int srcRowBytes;
-    OfxRectI srcBounds;
-    void *srcPtr = NULL;
-    gPropertySuite->propGetInt(sourceImg, kOfxImagePropRowBytes, 0, &srcRowBytes);
-    gPropertySuite->propGetIntN(sourceImg, kOfxImagePropBounds, 4, &srcBounds.x1);
-    gPropertySuite->propGetPointer(sourceImg, kOfxImagePropData, 0, &srcPtr);
-
-    if(srcPtr == NULL) {
-      throw "Bad source pointer";
-    }
-    printf("hue=%f\n", hue);
-    double minHue, maxHue;
-    minHue = hue - .5 * hue_width;
-    maxHue = hue + .5 * hue_width;
-    printf("hue=%lf minHue=%lf maxHue=%lf\n", hue, minHue, maxHue);
-    printf("saturation_low=%f saturation_high=%f maxHue=%f\n", saturation_low, saturation_high, maxHue);
-
+void ImageScaler::multiThreadProcessImages(OfxRectI p_ProcWindow)
+{
+    double minHue, maxHue, overflowed_h, underflowed_h;
+    minHue = _hue - .5 * _hueWidth;
+    maxHue = _hue + .5 * _hueWidth;
 
     int cc=0;
     // and do some processing
-      double h, s, l;
-      double hue_multiplier, sat_multiplier, lum_multiplier;
-    for(int y = renderWindow.y1; y < renderWindow.y2; y++) {
-      if(y % 20 == 0 && gImageEffectSuite->abort(instance)) break;
+    double h, s, l;
+    double hue_multiplier, sat_multiplier, lum_multiplier;
+    double hue_lower_softness_threshold, hue_upper_softness_threshold;
+    hue_lower_softness_threshold = minHue - _hueSoftness;
+    hue_upper_softness_threshold = maxHue + _hueSoftness;
 
-      // get the row start for the output image
-      T *dstPix = pixelAddress<T>(renderWindow.x1, y,
-                                  dstPtr,
-                                  dstBounds,
-                                  dstRowBytes,
-                                  nComps);
+    for(int y = p_ProcWindow.y1; y < p_ProcWindow.y2; y++) {
+        //if(y % 20 == 0 && gImageEffectSuite->abort(instance)) break;
+        if (_effect.abort()) break;
 
-      for(int x = renderWindow.x1; x < renderWindow.x2; x++) {
+        // get the row start for the output image
+        float* dstPix = static_cast<float*>(_dstImg->getPixelAddress(p_ProcWindow.x1, y));
 
-        // get the source pixel
-        T *srcPix = pixelAddress<T>(x, y,
-                                    srcPtr,
-                                    srcBounds,
-                                    srcRowBytes,
-                                    nComps);
+        for(int x = p_ProcWindow.x1; x < p_ProcWindow.x2; x++) {
+            // get the source pixel
+            float* srcPix = static_cast<float*>(_srcImg ? _srcImg->getPixelAddress(x, y) : 0);
 
+            if(srcPix) {
+                float r = srcPix[0];
+                float g = srcPix[1];
+                float b = srcPix[2];
+                rgb2hsl(r, g, b, &h, &s, &l);
 
-        if(srcPix) {
-          T r = srcPix[0];
-          T g = srcPix[1];
-          T b = srcPix[2];
-          rgb2hsl(r, g, b, &h, &s, &l);
+                if (_hueEnabled) {
+                    overflowed_h = h - 100.0;  // "wrapped around" hue, for testing against negative softness window
+                    underflowed_h = h + 100.0; // "wrapped around" hue, for testing against overflowed softness window
+                    if (h >= minHue && h <= maxHue) {
+                        hue_multiplier = 1.0;
+                    } else if (overflowed_h >= minHue && overflowed_h <= maxHue) {
+                        hue_multiplier = 1.0;
+                    } else if (underflowed_h >= minHue && underflowed_h <= maxHue) {
+                        hue_multiplier = 1.0;
+                    } else if (h > hue_lower_softness_threshold && h < minHue) {
+                        hue_multiplier = (h - hue_lower_softness_threshold) / _hueSoftness;
+                    } else if (overflowed_h > hue_lower_softness_threshold && overflowed_h < minHue) {
+                        hue_multiplier = (overflowed_h - hue_lower_softness_threshold) / _hueSoftness;
+                    } else if (h > maxHue && h <= hue_upper_softness_threshold) {
+                        hue_multiplier = (hue_upper_softness_threshold - h) / _hueSoftness;
+                    } else if (underflowed_h > maxHue && underflowed_h <= hue_upper_softness_threshold) {
+                        hue_multiplier = (hue_upper_softness_threshold - underflowed_h) / _hueSoftness;
+                    } else {
+                        hue_multiplier = 0.0;
+                    }
+                } else hue_multiplier = 1.0;
+                //if (cc<1) printf("%f %f %f min=%f max=%f a=%f\n", h, s, v, minHue, maxHue, a);
+                //if (cc<1) printf("%f %f %f min=%f max=%f\n", h, s, l, luminance_low, luminance_high);
 
-          if (hue_enabled) {
-            if (h >= minHue && h <= maxHue) {
-              hue_multiplier = 1.0;
-            } else if (h < minHue && h > minHue - hue_softness) {
-              hue_multiplier = (h - (minHue - hue_softness)) / hue_softness;
-            } else if (h > maxHue && h <= maxHue + hue_softness) {
-              hue_multiplier = 1.0 - ((h - maxHue) / hue_softness);
+                if (_saturationEnabled) {
+                    if (s >= _saturationLow && s <= _saturationHigh) {
+                        sat_multiplier = 1.0;
+                    } else if (s < _saturationLow && s > _saturationLow - _saturationLowSoftness) {
+                        sat_multiplier = (s - (_saturationLow - _saturationLowSoftness)) / _saturationLowSoftness;
+                    } else if (s > _saturationHigh && s < _saturationHigh + _saturationHighSoftness){
+                        sat_multiplier = 1.0 - (s - _saturationHigh) / _saturationHighSoftness;
+                    } else {
+                        sat_multiplier = 0.0;
+                    }
+                } else sat_multiplier = 1.0;
+
+                if (_luminanceEnabled) {
+                    if (l >= _luminanceLow && l <= _luminanceHigh) {
+                        lum_multiplier = 1.0;
+                    } else if (l < _luminanceLow && l > _luminanceLow - _luminanceLowSoftness) {
+                        lum_multiplier = (l - (_luminanceLow - _luminanceLowSoftness)) / _luminanceLowSoftness;
+                    } else if (s > _luminanceHigh && l < _luminanceHigh + _luminanceHighSoftness){
+                        lum_multiplier = 1.0 - (l - _luminanceHigh) / _luminanceHighSoftness;
+                    } else {
+                        lum_multiplier = 0.0;
+                    }
+                } else lum_multiplier = 1.0;
+                //if (cc<1) printf("lum multiplier=%f\n", lum_multiplier);
+
+                dstPix[0] = r;
+                dstPix[1] = g;
+                dstPix[2] = b;
+                dstPix[3] = hue_multiplier * sat_multiplier * lum_multiplier;
+                srcPix += 4;
+                dstPix += 4;
             } else {
-              hue_multiplier = 0.0;
+                // we don't have a pixel in the source image, set output to zero
+                for(int i = 0; i < 4; ++i) {
+                    *dstPix = 0;
+                    ++dstPix;
+                }
             }
-          } else hue_multiplier = 1.0;
-          //if (cc<1) printf("%f %f %f min=%f max=%f a=%f\n", h, s, v, minHue, maxHue, a);
-          //if (cc<1) printf("%f %f %f min=%f max=%f\n", h, s, l, luminance_low, luminance_high);
-
-          if (saturation_enabled) {
-            if (s >= saturation_low && s <= saturation_high) {
-              sat_multiplier = 1.0;
-            } else if (s < saturation_low && s > saturation_low - saturation_low_softness) {
-              sat_multiplier = (s - (saturation_low - saturation_low_softness)) / saturation_low_softness;
-            } else if (s > saturation_high && s < saturation_high + saturation_high_softness){
-              sat_multiplier = 1.0 - (s - saturation_high) / saturation_high_softness;
-            } else {
-              sat_multiplier = 0.0;
-            }
-          } else sat_multiplier = 1.0;
-
-          if (luminance_enabled) {
-            if (l >= luminance_low && l <= luminance_high) {
-              lum_multiplier = 1.0;
-            } else if (l < luminance_low && l > luminance_low - luminance_low_softness) {
-              lum_multiplier = (l - (luminance_low - luminance_low_softness)) / luminance_low_softness;
-            } else if (s > luminance_high && l < luminance_high + luminance_high_softness){
-              lum_multiplier = 1.0 - (l - luminance_high) / luminance_high_softness;
-            } else {
-              lum_multiplier = 0.0;
-            }
-          } else lum_multiplier = 1.0;
-          //if (cc<1) printf("lum multiplier=%f\n", lum_multiplier);
-
-
-
-          dstPix[0] = r;
-          dstPix[1] = g;
-          dstPix[2] = b;
-          dstPix[3] = hue_multiplier * sat_multiplier * lum_multiplier;
-          srcPix += 4;
-          dstPix += 4;
-        } else {
-          // we don't have a pixel in the source image, set output to zero
-          for(int i = 0; i < nComps; ++i) {
-            *dstPix = 0;
-            ++dstPix;
-          }
         }
-      }
-      cc++;
+        cc++;
     }
-  }
+}
 
+void ImageScaler::setSrcImg(OFX::Image* p_SrcImg)
+{
+    _srcImg = p_SrcImg;
+}
 
-  ////////////////////////////////////////////////////////////////////////////////
-  // Render an output image
-  OfxStatus RenderAction( OfxImageEffectHandle instance,
-                          OfxPropertySetHandle inArgs,
-                          OfxPropertySetHandle outArgs)
-  {
-    printf("Render start\n");
-    // get the render window and the time from the inArgs
-    OfxTime time;
-    OfxRectI renderWindow;
-    OfxStatus status = kOfxStatOK;
-
-    gPropertySuite->propGetDouble(inArgs, kOfxPropTime, 0, &time);
-    gPropertySuite->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &renderWindow.x1);
-
-    // get our instance data which has out clip and param handles
-  printf("16\n");
-    MyInstanceData *myData = FetchInstanceData(instance);
-
-    printf("17\n");
-    // get our param values
-    int hue_enabled = 0;
-    double hue = 50.0;
-    double hue_width = 100.0;
-    double hue_softness = 10.0;
-    int saturation_enabled = 0;
-    double saturation_low = 0.0;
-    double saturation_high = 100.0;
-    double saturation_low_softness = 10.0;
-    double saturation_high_softness = 10.0;
-    int luminance_enabled = 0;
-    double luminance_low = 0.0;
-    double luminance_high = 100.0;
-    double luminance_low_softness = 10.0;
-    double luminance_high_softness = 10.0;
-    gParameterSuite->paramGetValueAtTime(myData->hueEnabledParam, time, &hue_enabled);
-    gParameterSuite->paramGetValueAtTime(myData->saturationEnabledParam, time, &saturation_enabled);
-    gParameterSuite->paramGetValueAtTime(myData->luminanceEnabledParam, time, &luminance_enabled);
-    gParameterSuite->paramGetValueAtTime(myData->hueParam, time, &hue);
-    gParameterSuite->paramGetValueAtTime(myData->hueWidthParam, time, &hue_width);
-    gParameterSuite->paramGetValueAtTime(myData->hueSoftnessParam, time, &hue_softness);
-    gParameterSuite->paramGetValueAtTime(myData->saturationLowParam, time, &saturation_low);
-    gParameterSuite->paramGetValueAtTime(myData->saturationHighParam, time, &saturation_high);
-    gParameterSuite->paramGetValueAtTime(myData->saturationLowSoftnessParam, time, &saturation_low_softness);
-    gParameterSuite->paramGetValueAtTime(myData->saturationHighSoftnessParam, time, &saturation_high_softness);
-    gParameterSuite->paramGetValueAtTime(myData->luminanceLowParam, time, &luminance_low);
-    gParameterSuite->paramGetValueAtTime(myData->luminanceHighParam, time, &luminance_high);
-    gParameterSuite->paramGetValueAtTime(myData->luminanceLowSoftnessParam, time, &luminance_low_softness);
-    gParameterSuite->paramGetValueAtTime(myData->luminanceHighSoftnessParam, time, &luminance_high_softness);
-
-    printf("99\n");
-
-    // the property sets holding our images
-    OfxPropertySetHandle outputImg = NULL, sourceImg = NULL;
-    try {
-      // fetch image to render into from that clip
-      OfxPropertySetHandle outputImg;
-      if(gImageEffectSuite->clipGetImage(myData->outputClip, time, NULL, &outputImg) != kOfxStatOK) {
-        throw " no output image!";
-      }
-
-      // fetch image at render time from that clip
-      if (gImageEffectSuite->clipGetImage(myData->sourceClip, time, NULL, &sourceImg) != kOfxStatOK) {
-        throw " no source image!";
-      }
-
-      // figure out the data types
-      char *cstr;
-      gPropertySuite->propGetString(outputImg, kOfxImageEffectPropComponents, 0, &cstr);
-      std::string components = cstr;
-
-      // how many components per pixel?
-      int nComps = 0;
-      if(components == kOfxImageComponentRGBA) {
-        nComps = 4;
-      }
-      else if(components == kOfxImageComponentRGB) {
-        nComps = 3;
-      }
-      else if(components == kOfxImageComponentAlpha) {
-        nComps = 1;
-      }
-      else {
-        throw " bad pixel type!";
-      }
-      printf("50\n");
-
-      // now do our render depending on the data type
-      gPropertySuite->propGetString(outputImg, kOfxImageEffectPropPixelDepth, 0, &cstr);
-      std::string dataType = cstr;
-
-      if(dataType == kOfxBitDepthByte) {
-        PixelProcessing<unsigned char, 255>(hue_enabled, hue, hue_width, hue_softness,
-                                            saturation_enabled, saturation_low, saturation_high, saturation_low_softness, saturation_high_softness,
-                                            luminance_enabled, luminance_low, luminance_high, luminance_low_softness, luminance_high_softness,
-                                            instance, sourceImg, outputImg, renderWindow, nComps);
-      }
-      else if(dataType == kOfxBitDepthShort) {
-        PixelProcessing<unsigned short, 65535>(hue_enabled, hue, hue_width, hue_softness,
-                                               saturation_enabled, saturation_low, saturation_high, saturation_low_softness, saturation_high_softness,
-                                               luminance_enabled, luminance_low, luminance_high, luminance_low_softness, luminance_high_softness,
-                                               instance, sourceImg, outputImg, renderWindow, nComps);
-      }
-      else if (dataType == kOfxBitDepthFloat) {
-        PixelProcessing<float, 1>(hue_enabled, hue, hue_width, hue_softness,
-                                  saturation_enabled, saturation_low, saturation_high, saturation_low_softness, saturation_high_softness,
-                                  luminance_enabled, luminance_low, luminance_high, luminance_low_softness, luminance_high_softness,
-                                  instance, sourceImg, outputImg, renderWindow, nComps);
-      }
-      else {
-        throw " bad data type!";
-        throw 1;
-      }
-
-    }
-    catch(const char *errStr ) {
-      bool isAborting = gImageEffectSuite->abort(instance);
-
-      // if we were interrupted, the failed fetch is fine, just return kOfxStatOK
-      // otherwise, something wierd happened
-      if(!isAborting) {
-        status = kOfxStatFailed;
-      }
-      ERROR_IF(!isAborting, " Rendering failed because %s", errStr);
-
-    }
-
-    if(sourceImg)
-      gImageEffectSuite->clipReleaseImage(sourceImg);
-    if(outputImg)
-      gImageEffectSuite->clipReleaseImage(outputImg);
-
-    printf("Render end\n");
-    // all was well
-    return status;
-  }
-
-  // are the settings of the effect making it redundant and so not do anything to the image data
-  OfxStatus IsIdentityAction( OfxImageEffectHandle instance,
-                              OfxPropertySetHandle inArgs,
-                              OfxPropertySetHandle outArgs)
-  {
-    return kOfxStatReplyDefault;
-    MyInstanceData *myData = FetchInstanceData(instance);
-
-    double time;
-    gPropertySuite->propGetDouble(inArgs, kOfxPropTime, 0, &time);
-
-    double hue = 1.0;
-    gParameterSuite->paramGetValueAtTime(myData->hueParam, time, &hue);
-
-    // if the hue value is 1.0 (or nearly so) say we aren't doing anything
-    if(fabs(hue - 1.0) < 0.000000001) {
-      // we set the name of the input clip to pull default images from
-      gPropertySuite->propSetString(outArgs, kOfxPropName, 0, "Source");
-      // and say we trapped the action and we are at the identity
-      return kOfxStatOK;
-    }
-
-    // say we aren't at the identity
-    return kOfxStatReplyDefault;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // Call back passed to the host in the OfxPlugin struct to set our host pointer
-  //
-  // This must be called AFTER both OfxGetNumberOfPlugins and OfxGetPlugin, but
-  // before the pluginMain entry point is ever touched.
-  void SetHostFunc(OfxHost *hostStruct)
-  {
-    gHost = hostStruct;
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////
-  // The main entry point function, the host calls this to get the plugin to do things.
-  OfxStatus MainEntryPoint(const char *action, const void *handle, OfxPropertySetHandle inArgs,  OfxPropertySetHandle outArgs)
-  {
-    printf("action is : %s \n", action );
-    // cast to appropriate type
-    OfxImageEffectHandle effect = (OfxImageEffectHandle) handle;
-
-    OfxStatus returnStatus = kOfxStatReplyDefault;
-
-    if(strcmp(action, kOfxActionLoad) == 0) {
-      // The very first action called on a plugin.
-      returnStatus = LoadAction();
-    }
-    else if(strcmp(action, kOfxActionDescribe) == 0) {
-      // the first action called to describe what the plugin does
-      returnStatus = DescribeAction(effect);
-    }
-    else if(strcmp(action, kOfxImageEffectActionDescribeInContext) == 0) {
-      // the second action called to describe what the plugin does in a specific context
-      returnStatus = DescribeInContextAction(effect, inArgs);
-    }
-    else if(strcmp(action, kOfxActionCreateInstance) == 0) {
-      // the action called when an instance of a plugin is created
-      returnStatus = CreateInstanceAction(effect);
-    }
-    else if(strcmp(action, kOfxActionDestroyInstance) == 0) {
-      // the action called when an instance of a plugin is destroyed
-      returnStatus = DestroyInstanceAction(effect);
-    }
-    else if(strcmp(action, kOfxImageEffectActionIsIdentity) == 0) {
-      // Check to see if our param settings cause nothing to happen
-      returnStatus = IsIdentityAction(effect, inArgs, outArgs);
-    }
-    else if(strcmp(action, kOfxImageEffectActionRender) == 0) {
-      // action called to render a frame
-      returnStatus = RenderAction(effect, inArgs, outArgs);
-    }
-    else {
-      printf("unhandled\n");
-    }
-
-    MESSAGE(": END action is : %s \n", action );
-    /// other actions to take the default value
-    return returnStatus;
-  }
-
-} // end of anonymous namespace
+void ImageScaler::setParams(
+        bool p_hueEnabled, float p_hue, float p_hueWidth, float p_hueSoftness,
+        bool p_saturationEnabled, float p_saturationLow, float p_saturationHigh, float p_saturationLowSoftness, float p_saturationHighSoftness,
+        bool p_luminanceEnabled, float p_luminanceLow, float p_luminanceHigh, float p_luminanceLowSoftness, float p_luminanceHighSoftness
+)
+{
+    _hueEnabled = p_hueEnabled;
+    _hue = p_hue;
+    _hueWidth = p_hueWidth;
+    _hueSoftness = p_hueSoftness;
+    _saturationEnabled = p_saturationEnabled;
+    _saturationLow = p_saturationLow;
+    _saturationHigh = p_saturationHigh;
+    _saturationLowSoftness = p_saturationLowSoftness;
+    _saturationHighSoftness = p_saturationHighSoftness;
+    _luminanceEnabled = p_luminanceEnabled;
+    _luminanceLow = p_luminanceLow;
+    _luminanceHigh = p_luminanceHigh;
+    _luminanceLowSoftness = p_luminanceLowSoftness;
+    _luminanceHighSoftness = p_luminanceHighSoftness;
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////
-// The plugin struct passed back to the host application to initiate bootstrapping
-// of plugin communications
-static OfxPlugin effectPluginStruct =
+/** @brief The plugin that does our work */
+class QualiFlowerPlugin : public OFX::ImageEffect
 {
-  kOfxImageEffectPluginApi,                // The API this plugin satisfies.
-  1,                                       // The version of the API it satisifes.
-  "joeboy.qualiflower",                    // The unique ID of this plugin.
-  1,                                       // The major version number of this plugin.
-  0,                                       // The minor version number of this plugin.
-  SetHostFunc,                             // Function used to pass back to the plugin the OFXHost struct.
-  MainEntryPoint                           // The main entry point to the plugin where all actions are passed to.
+public:
+    explicit QualiFlowerPlugin(OfxImageEffectHandle p_Handle);
+
+    /* Override the render */
+    virtual void render(const OFX::RenderArguments& p_Args);
+
+    /* Override is identity */
+    virtual bool isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime);
+
+    /* Override changedParam */
+    virtual void changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName);
+
+    /* Override changed clip */
+    virtual void changedClip(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ClipName);
+
+    /* Set the enabledness of the params depending on the type of input image and the state of the checkboxes */
+    void setEnabledness();
+
+    /* Set up and run a processor */
+    void setupAndProcess(ImageScaler &p_ImageScaler, const OFX::RenderArguments& p_Args);
+
+private:
+    // Does not own the following pointers
+    OFX::Clip* m_DstClip;
+    OFX::Clip* m_SrcClip;
+
+    OFX::DoubleParam* m_Scale;
+    OFX::DoubleParam* m_ScaleR;
+    OFX::DoubleParam* m_ScaleG;
+    OFX::DoubleParam* m_ScaleB;
+    OFX::DoubleParam* m_ScaleA;
+    OFX::BooleanParam* m_ComponentScalesEnabled;
+
+    OFX::BooleanParam* m_hueEnabled;
+    OFX::DoubleParam* m_hue;
+    OFX::DoubleParam* m_hueWidth;
+    OFX::DoubleParam* m_hueSoftness;
+
+    OFX::BooleanParam* m_saturationEnabled;
+    OFX::DoubleParam* m_saturationLow;
+    OFX::DoubleParam* m_saturationHigh;
+    OFX::DoubleParam* m_saturationLowSoftness;
+    OFX::DoubleParam* m_saturationHighSoftness;
+
+    OFX::BooleanParam* m_luminanceEnabled;
+    OFX::DoubleParam* m_luminanceLow;
+    OFX::DoubleParam* m_luminanceHigh;
+    OFX::DoubleParam* m_luminanceLowSoftness;
+    OFX::DoubleParam* m_luminanceHighSoftness;
+
 };
 
-////////////////////////////////////////////////////////////////////////////////
-// The first of the two functions that a host application will look for
-// after loading the binary, this function returns the number of plugins within
-// this binary.
-//
-// This will be the first function called by the host.
-EXPORT int OfxGetNumberOfPlugins(void)
+QualiFlowerPlugin::QualiFlowerPlugin(OfxImageEffectHandle p_Handle)
+    : ImageEffect(p_Handle)
 {
-  return 1;
+    m_DstClip = fetchClip(kOfxImageEffectOutputClipName);
+    m_SrcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
+
+    m_hueEnabled = fetchBooleanParam("selectByHueEnabled");
+    m_hue = fetchDoubleParam("hue");
+    m_hueWidth = fetchDoubleParam("hueWidth");
+    m_hueSoftness = fetchDoubleParam("hueSoftness");
+
+    m_saturationEnabled = fetchBooleanParam("selectBySaturationEnabled");
+    m_saturationLow = fetchDoubleParam("saturationLow");
+    m_saturationHigh = fetchDoubleParam("saturationHigh");
+    m_saturationLowSoftness = fetchDoubleParam("saturationLowSoftness");
+    m_saturationHighSoftness = fetchDoubleParam("saturationHighSoftness");
+
+    m_luminanceEnabled = fetchBooleanParam("selectByLuminanceEnabled");
+    m_luminanceLow = fetchDoubleParam("luminanceLow");
+    m_luminanceHigh = fetchDoubleParam("luminanceHigh");
+    m_luminanceLowSoftness = fetchDoubleParam("luminanceLowSoftness");
+    m_luminanceHighSoftness = fetchDoubleParam("luminanceHighSoftness");
+
+    // Set the enabledness of our sliders
+    setEnabledness();
+}
+
+void QualiFlowerPlugin::render(const OFX::RenderArguments& p_Args)
+{
+    if ((m_DstClip->getPixelDepth() == OFX::eBitDepthFloat) && (m_DstClip->getPixelComponents() == OFX::ePixelComponentRGBA))
+    {
+        ImageScaler imageScaler(*this);
+        setupAndProcess(imageScaler, p_Args);
+    }
+    else
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+    }
+}
+
+bool QualiFlowerPlugin::isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime)
+{
+    bool hueEnabled = m_hueEnabled->getValueAtTime(p_Args.time);
+    bool saturationEnabled = m_saturationEnabled->getValueAtTime(p_Args.time);
+    bool luminanceEnabled = m_luminanceEnabled->getValueAtTime(p_Args.time);
+    // TODO: Could also check for all 0-100% values here
+    if (!hueEnabled && !saturationEnabled && !luminanceEnabled) {
+         p_IdentityClip = m_SrcClip;
+         p_IdentityTime = p_Args.time;
+        return true;
+    }
+    return false;
+}
+
+void QualiFlowerPlugin::changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName)
+{
+    if (
+        p_ParamName == "selectByHueEnabled"
+        || (p_ParamName == "selectBySaturationEnabled")
+        || (p_ParamName == "selectByLuminanceEnabled")
+    )
+    {
+        setEnabledness();
+    }
+}
+
+void QualiFlowerPlugin::changedClip(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ClipName)
+{
+    if (p_ClipName == kOfxImageEffectSimpleSourceClipName)
+    {
+        setEnabledness();
+    }
+}
+
+void QualiFlowerPlugin::setEnabledness()
+{
+    // the param enabledness depends on the clip being RGBA and the param being true
+    const bool enableHue = (m_hueEnabled->getValue() && (m_SrcClip->getPixelComponents() == OFX::ePixelComponentRGBA));
+    const bool enableSaturation = (m_saturationEnabled->getValue() && (m_SrcClip->getPixelComponents() == OFX::ePixelComponentRGBA));
+    const bool enableLuminance = (m_luminanceEnabled->getValue() && (m_SrcClip->getPixelComponents() == OFX::ePixelComponentRGBA));
+    m_hue->setEnabled(enableHue);
+    m_hueWidth->setEnabled(enableHue);
+    m_hueSoftness->setEnabled(enableHue);
+    m_saturationLow->setEnabled(enableSaturation);
+    m_saturationHigh->setEnabled(enableSaturation);
+    m_saturationLowSoftness->setEnabled(enableSaturation);
+    m_saturationHighSoftness->setEnabled(enableSaturation);
+    m_luminanceLow->setEnabled(enableLuminance);
+    m_luminanceLowSoftness->setEnabled(enableLuminance);
+    m_luminanceHigh->setEnabled(enableLuminance);
+    m_luminanceHighSoftness->setEnabled(enableLuminance);
+}
+
+void QualiFlowerPlugin::setupAndProcess(ImageScaler& p_ImageScaler, const OFX::RenderArguments& p_Args)
+{
+    // Get the dst image
+    std::auto_ptr<OFX::Image> dst(m_DstClip->fetchImage(p_Args.time));
+    OFX::BitDepthEnum dstBitDepth = dst->getPixelDepth();
+    OFX::PixelComponentEnum dstComponents = dst->getPixelComponents();
+
+    // Get the src image
+    std::auto_ptr<OFX::Image> src(m_SrcClip->fetchImage(p_Args.time));
+    OFX::BitDepthEnum srcBitDepth = src->getPixelDepth();
+    OFX::PixelComponentEnum srcComponents = src->getPixelComponents();
+
+    // Check to see if the bit depth and number of components are the same
+    if ((srcBitDepth != dstBitDepth) || (srcComponents != dstComponents))
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrValue);
+    }
+
+    bool hueEnabled = m_hueEnabled->getValueAtTime(p_Args.time);
+    float hue = m_hue->getValueAtTime(p_Args.time);
+    float hueWidth = m_hueWidth->getValueAtTime(p_Args.time);
+    float hueSoftness = m_hueSoftness->getValueAtTime(p_Args.time);
+    bool saturationEnabled = m_saturationEnabled->getValueAtTime(p_Args.time);
+    float saturationLow = m_saturationLow->getValueAtTime(p_Args.time);
+    float saturationHigh = m_saturationHigh->getValueAtTime(p_Args.time);
+    float saturationLowSoftness = m_saturationLowSoftness->getValueAtTime(p_Args.time);
+    float saturationHighSoftness = m_saturationHighSoftness->getValueAtTime(p_Args.time);
+    bool luminanceEnabled = m_luminanceEnabled->getValueAtTime(p_Args.time);
+    float luminanceLow = m_luminanceLow->getValueAtTime(p_Args.time);
+    float luminanceHigh = m_luminanceHigh->getValueAtTime(p_Args.time);
+    float luminanceLowSoftness = m_luminanceLowSoftness->getValueAtTime(p_Args.time);
+    float luminanceHighSoftness = m_luminanceHighSoftness->getValueAtTime(p_Args.time);
+
+    // Set the images
+    p_ImageScaler.setDstImg(dst.get());
+    p_ImageScaler.setSrcImg(src.get());
+
+    // Setup OpenCL and CUDA Render arguments
+    p_ImageScaler.setGPURenderArgs(p_Args);
+
+    // Set the render window
+    p_ImageScaler.setRenderWindow(p_Args.renderWindow);
+
+    p_ImageScaler.setParams(
+        hueEnabled, hue, hueWidth, hueSoftness,
+        saturationEnabled, saturationLow, saturationHigh, saturationLowSoftness, saturationHighSoftness,
+        luminanceEnabled, luminanceLow, luminanceHigh, luminanceLowSoftness, luminanceHighSoftness
+    );
+
+    // Call the base class process member, this will call the derived templated process code
+    p_ImageScaler.process();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// The second of the two functions that a host application will look for
-// after loading the binary, this function returns the 'nth' plugin declared in
-// this binary.
-//
-// This will be called multiple times by the host, once for each plugin present.
-EXPORT OfxPlugin * OfxGetPlugin(int nth)
+
+using namespace OFX;
+
+QualiFlowerPluginFactory::QualiFlowerPluginFactory()
+    : OFX::PluginFactoryHelper<QualiFlowerPluginFactory>(kPluginIdentifier, kPluginVersionMajor, kPluginVersionMinor)
 {
-  if(nth == 0)
-    return &effectPluginStruct;
-  return 0;
+}
+
+void QualiFlowerPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
+{
+    // Basic labels
+    p_Desc.setLabels(kPluginName, kPluginName, kPluginName);
+    p_Desc.setPluginGrouping(kPluginGrouping);
+    p_Desc.setPluginDescription(kPluginDescription);
+
+    // Add the supported contexts, only filter at the moment
+    p_Desc.addSupportedContext(eContextFilter);
+    p_Desc.addSupportedContext(eContextGeneral);
+
+    // Add supported pixel depths
+    p_Desc.addSupportedBitDepth(eBitDepthFloat);
+
+    // Set a few flags
+    p_Desc.setSingleInstance(false);
+    p_Desc.setHostFrameThreading(false);
+    p_Desc.setSupportsMultiResolution(kSupportsMultiResolution);
+    p_Desc.setSupportsTiles(kSupportsTiles);
+    p_Desc.setTemporalClipAccess(false);
+    p_Desc.setRenderTwiceAlways(false);
+    p_Desc.setSupportsMultipleClipPARs(kSupportsMultipleClipPARs);
+
+    // Setup OpenCL render capability flags
+    p_Desc.setSupportsOpenCLRender(false);
+
+    // Setup CUDA render capability flags on non-Apple system
+#ifndef __APPLE__
+    p_Desc.setSupportsCudaRender(true);
+    p_Desc.setSupportsCudaStream(true);
+#endif
+
+    // Setup Metal render capability flags only on Apple system
+#ifdef __APPLE__
+     p_Desc.setSupportsMetalRender(false);
+#endif
+
+    // Indicates that the plugin output does not depend on location or neighbours of a given pixel.
+    // Therefore, this plugin could be executed during LUT generation.
+    p_Desc.setNoSpatialAwareness(true);
+}
+
+static DoubleParamDescriptor* defineScaleParam(OFX::ImageEffectDescriptor& p_Desc, const std::string& p_Name, const std::string& p_Label,
+                                               const std::string& p_Hint, GroupParamDescriptor* p_Parent)
+{
+    DoubleParamDescriptor* param = p_Desc.defineDoubleParam(p_Name);
+    param->setLabels(p_Label, p_Label, p_Label);
+    param->setScriptName(p_Name);
+    param->setHint(p_Hint);
+    param->setDefault(1);
+    param->setRange(0, 100);
+    param->setIncrement(1.0);
+    param->setDisplayRange(0, 100);
+    param->setDoubleType(eDoubleTypeScale);
+
+    if (p_Parent)
+    {
+        param->setParent(*p_Parent);
+    }
+
+    return param;
+}
+
+
+void QualiFlowerPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, OFX::ContextEnum /*p_Context*/)
+{
+    // Source clip only in the filter context
+    // Create the mandated source clip
+    ClipDescriptor* srcClip = p_Desc.defineClip(kOfxImageEffectSimpleSourceClipName);
+    srcClip->addSupportedComponent(ePixelComponentRGBA);
+    srcClip->setTemporalClipAccess(false);
+    srcClip->setSupportsTiles(kSupportsTiles);
+    srcClip->setIsMask(false);
+
+    // Create the mandated output clip
+    ClipDescriptor* dstClip = p_Desc.defineClip(kOfxImageEffectOutputClipName);
+    dstClip->addSupportedComponent(ePixelComponentRGBA);
+    dstClip->addSupportedComponent(ePixelComponentAlpha);
+    dstClip->setSupportsTiles(kSupportsTiles);
+
+    // Make some pages and to things in
+    PageParamDescriptor* page = p_Desc.definePageParam("Controls");
+
+    // Group param to group the scales
+    GroupParamDescriptor* selectionGroup = p_Desc.defineGroupParam("Selections");
+    selectionGroup->setHint("HSL selection");
+    selectionGroup->setLabels("Selection", "Selection", "Selection");
+
+    DoubleParamDescriptor* param;
+    BooleanParamDescriptor* boolParam;
+    boolParam = p_Desc.defineBooleanParam("selectByHueEnabled");
+    boolParam->setDefault(true);
+    boolParam->setHint("Enable selection by hue");
+    boolParam->setLabels("Select by Hue", "Select by Hue", "Select by Hue");
+    boolParam->setParent(*selectionGroup);
+    page->addChild(*boolParam);
+    param = defineScaleParam(p_Desc, "hue", "Hue", "Hue selection", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "hueWidth", "Hue Width", "Hue width", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "hueSoftness", "Hue Softness", "Hue softness", selectionGroup);
+    page->addChild(*param);
+
+    boolParam = p_Desc.defineBooleanParam("selectBySaturationEnabled");
+    boolParam->setDefault(true);
+    boolParam->setHint("Enable selection by saturation");
+    boolParam->setLabels("Select by Saturation", "Select by Saturation", "Select by Saturation");
+    boolParam->setParent(*selectionGroup);
+    page->addChild(*boolParam);
+    param = defineScaleParam(p_Desc, "saturationLow", "Saturation Low", "Saturation Low", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "saturationHigh", "Saturation High", "Saturation High", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "saturationLowSoftness", "Saturation Low Softness", "Saturation Low softness", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "saturationHighSoftness", "Saturation High Softness", "Saturation High softness", selectionGroup);
+    page->addChild(*param);
+
+    boolParam = p_Desc.defineBooleanParam("selectByLuminanceEnabled");
+    boolParam->setDefault(true);
+    boolParam->setHint("Enable selection by luminance");
+    boolParam->setLabels("Select by Luminance", "Select by Luminance", "Select by Luminance");
+    boolParam->setParent(*selectionGroup);
+    page->addChild(*boolParam);
+    param = defineScaleParam(p_Desc, "luminanceLow", "Luminance Low", "Luminance Low", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "luminanceHigh", "Luminance High", "Luminance High", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "luminanceLowSoftness", "Luinance Low Softness", "Luminance Low softness", selectionGroup);
+    page->addChild(*param);
+    param = defineScaleParam(p_Desc, "luminanceHighSoftness", "Luminance High Softness", "Luminance High softness", selectionGroup);
+    page->addChild(*param);
+}
+
+ImageEffect* QualiFlowerPluginFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
+{
+    return new QualiFlowerPlugin(p_Handle);
+}
+
+void OFX::Plugin::getPluginIDs(PluginFactoryArray& p_FactoryArray)
+{
+    static QualiFlowerPluginFactory qualiflowerPlugin;
+    p_FactoryArray.push_back(&qualiflowerPlugin);
 }

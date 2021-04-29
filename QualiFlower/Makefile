@@ -1,28 +1,39 @@
-CXXFLAGS = -I/home/joe/building/openfx/include -Wall
-OPTIMIZER = -O3
-BUNDLE_DIRNAME = QualiFlower-0.1.ofx.bundle
+UNAME_SYSTEM := $(shell uname -s)
 
-bundle : qualiflower.dso
-	mkdir -p $(BUNDLE_DIRNAME)/Contents/Linux-x86-64
-	mkdir -p $(BUNDLE_DIRNAME)/Contents/Resources
-	cp qualiflower.dso $(BUNDLE_DIRNAME)/Contents/Linux-x86-64/QualiFlower-0.1.ofx
+# In theory the support libs are open source, but I'm not sure where the required versions are,
+# other than being distributed with Davinci Resolve
+CXXFLAGS = -fvisibility=hidden -Wno-deprecated -I/opt/resolve/Developer/OpenFX/Support/include -I/opt/resolve/Developer/OpenFX/OpenFX-1.4/include
 
-qualiflower.dso : qualiflower.o
-	$(CXX) -shared qualiflower.o -o qualiflower.dso
-#	strip -fhls qualiflower.dso
+ifeq ($(UNAME_SYSTEM), Linux)
+	CXXFLAGS += -fPIC
+	CUDAPATH ?= /usr
+	NVCC ?= ${CUDAPATH}/bin/nvcc
+	NVCCFLAGS = --compiler-options="-fPIC"
+	LDFLAGS = -shared -fvisibility=hidden -L${CUDAPATH}/lib64 -lcuda -lcudart_static
+	BUNDLE_DIR = QualiFlower-0.2.ofx.bundle/Contents/Linux-x86-64
+	CUDA_OBJ = CudaKernel.o
+else
+	LDFLAGS = -bundle -fvisibility=hidden -F/Library/Frameworks -framework OpenCL -framework Metal -framework AppKit
+	BUNDLE_DIR = QualiFlower-0.2.ofx.bundle/Contents/MacOS/
+endif
 
-%.o : %.cpp
-	$(CXX) -fPIC $(CXXFLAGS) -c -o $@ $^
+QualiFlower.ofx: qualiflower.o ${CUDA_OBJ} ofxsCore.o ofxsImageEffect.o ofxsInteract.o ofxsLog.o ofxsMultiThread.o ofxsParams.o ofxsProperty.o ofxsPropertyValidation.o
+	$(CXX) $^ -o $@ $(LDFLAGS)
+	mkdir -p $(BUNDLE_DIR)
+	cp QualiFlower.ofx $(BUNDLE_DIR)/QualiFlower-0.2.ofx
 
-clean :
-	rm -f *.o *.dso
-	rm -f $(BUNDLE_DIRNAME)/Contents/Linux-x86-64/*.ofx
+CudaKernel.o: CudaKernel.cu
+	${NVCC} -c $< $(NVCCFLAGS)
 
-test : bundle
-#	OFX_PLUGIN_PATH=./ sam-plugins
-	rm -rf out/*.png
-	OFX_PLUGIN_PATH=./ sam do reader in/#####.png // joeboy:qualiflower // writer out/#####.png
-	djv_view out/00001.png
+%.o: ../Support/Library/%.cpp
+	$(CXX) -c $< $(CXXFLAGS)
 
-install : bundle
-	cp -r $(BUNDLE_DIRNAME) /usr/local/OFX/
+clean:
+	rm -f *.o *.ofx
+	rm -fr QualiFlower-0.2.ofx.bundle
+
+install: QualiFlower.ofx
+	cp -fr QualiFlower-0.2.ofx.bundle /Library/OFX/Plugins
+
+test: QualiFlower.ofx
+	OFX_PLUGIN_PATH=/home/joe/building/joeboy-ofx-plugins/QualiFlowerx:/home/joe/building/joeboy-ofx-plugins/QualiFlower:/home/joe/building/joeboy-ofx-plugins/GainPlugin /opt/resolve/bin/resolve
