@@ -2,8 +2,13 @@
 
 A place to put openfx video plugins, if I write any.
 
-Currently there's just a sketchy temporal average plugin, which averages frames
-with the previous and next frames. Hopefully it might be useful for removing
-the sensor noise from my Canon DSLR footage, although I haven't really tried it
-yet. It's not finished and has bad hardcoded things in it, so don't try to use
-it unless you're happy to debug it and rewrite bits of it.
+So far:
+
+* QualiFlower, an effort at implementing something like Davinci Resolve's
+  qualifier as an OFX plugin. Can be used to select by hue, saturation and
+  luminance.
+
+* TemporalAverage, an effort at doing a temporal averaging plugin, which I got
+  some way into doing but didn't finish. Has bad hardcoded things in it. Don't
+  try and use it. There's a "Temporal Blur" plugin in the Davinci Resolve
+  developer examples, which I suspect does the same thing.
